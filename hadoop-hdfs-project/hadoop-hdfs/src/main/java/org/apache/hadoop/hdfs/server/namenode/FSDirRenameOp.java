@@ -17,6 +17,7 @@
  */
 package org.apache.hadoop.hdfs.server.namenode;
 
+import org.apache.commons.math3.util.Pair;
 import org.apache.hadoop.util.Preconditions;
 import org.apache.hadoop.fs.FileAlreadyExistsException;
 import org.apache.hadoop.fs.FileStatus;
@@ -68,11 +69,11 @@ class FSDirRenameOp {
    * Verify quota for rename operation where srcInodes[srcInodes.length-1] moves
    * dstInodes[dstInodes.length-1]
    */
-  private static void verifyQuotaForRename(FSDirectory fsd, INodesInPath src,
-      INodesInPath dst) throws QuotaExceededException {
+  private static Pair<QuotaCounts, QuotaCounts> verifyQuotaForRename(FSDirectory fsd, INodesInPath src,
+                                                                     INodesInPath dst) throws QuotaExceededException {
     if (!fsd.getFSNamesystem().isImageLoaded() || fsd.shouldSkipQuotaChecks()) {
       // Do not check quota if edits log is still being processed
-      return;
+      return new Pair<>(null, null);
     }
     int i = 0;
     while(src.getINode(i) == dst.getINode(i)) { i++; }
@@ -85,16 +86,22 @@ class FSDirRenameOp {
     final byte storagePolicyID = isSrcSetSp ?
         src.getLastINode().getLocalStoragePolicyID() :
         dstParent.getStoragePolicyID();
-    final QuotaCounts delta = src.getLastINode()
+    final QuotaCounts srcQuotaCounts = src.getLastINode()
         .computeQuotaUsage(bsps, storagePolicyID, false,
             Snapshot.CURRENT_STATE_ID);
 
     // Reduce the required quota by dst that is being removed
     final INode dstINode = dst.getLastINode();
+    QuotaCounts srcRes = srcQuotaCounts.negation();
+    QuotaCounts detRes = null;
+
     if (dstINode != null) {
-      delta.subtract(dstINode.computeQuotaUsage(bsps));
+      QuotaCounts dstQuotaCounts = dstINode.computeQuotaUsage(bsps);
+      detRes = dstQuotaCounts.negation();
+      srcQuotaCounts.subtract(dstQuotaCounts);
     }
-    FSDirectory.verifyQuota(dst, dst.length() - 1, delta, src.getINode(i - 1));
+    FSDirectory.verifyQuota(dst, dst.length() - 1, srcQuotaCounts, src.getINode(i - 1));
+    return Pair.create(srcRes, detRes);
   }
 
   /**
@@ -202,9 +209,9 @@ class FSDirRenameOp {
     fsd.ezManager.checkMoveValidity(srcIIP, dstIIP);
     // Ensure dst has quota to accommodate rename
     verifyFsLimitsForRename(fsd, srcIIP, dstIIP);
-    verifyQuotaForRename(fsd, srcIIP, dstIIP);
+    Pair<QuotaCounts, QuotaCounts> quotaCountsQuotaCountsPair = verifyQuotaForRename(fsd, srcIIP, dstIIP);
 
-    RenameOperation tx = new RenameOperation(fsd, srcIIP, dstIIP);
+    RenameOperation tx = new RenameOperation(fsd, srcIIP, dstIIP, quotaCountsQuotaCountsPair);
 
     boolean added = false;
 
@@ -421,9 +428,9 @@ class FSDirRenameOp {
 
     // Ensure dst has quota to accommodate rename
     verifyFsLimitsForRename(fsd, srcIIP, dstIIP);
-    verifyQuotaForRename(fsd, srcIIP, dstIIP);
+    Pair<QuotaCounts, QuotaCounts> quotaCountsQuotaCountsPair = verifyQuotaForRename(fsd, srcIIP, dstIIP);
 
-    RenameOperation tx = new RenameOperation(fsd, srcIIP, dstIIP);
+    RenameOperation tx = new RenameOperation(fsd, srcIIP, dstIIP, quotaCountsQuotaCountsPair);
 
     boolean undoRemoveSrc = true;
     tx.removeSrc();
@@ -639,15 +646,20 @@ class FSDirRenameOp {
     private final boolean isSrcInSnapshot;
     private final boolean srcChildIsReference;
     private final QuotaCounts oldSrcCounts;
-    private INode srcChild;
-    private INode oldDstChild;
+    private INode srcChild; //verfy quota src是算的他的quota
+    private INode oldDstChild; //verfy quota dst是算的他的quota
+    private QuotaCounts srcChildQuotaCounts;
+    private QuotaCounts dstChildQuotaCounts;
 
-    RenameOperation(FSDirectory fsd, INodesInPath srcIIP, INodesInPath dstIIP) {
+    RenameOperation(FSDirectory fsd, INodesInPath srcIIP, INodesInPath dstIIP,
+            Pair<QuotaCounts, QuotaCounts> quotaCountsPair) {
       this.fsd = fsd;
       this.srcIIP = srcIIP;
       this.dstIIP = dstIIP;
       this.srcParentIIP = srcIIP.getParentINodesInPath();
       this.dstParentIIP = dstIIP.getParentINodesInPath();
+      this.srcChildQuotaCounts = quotaCountsPair.getKey() == null ? null : quotaCountsPair.getKey().negation();
+      this.dstChildQuotaCounts = quotaCountsPair.getValue()  == null ? null :quotaCountsPair.getValue().negation() ;
 
       BlockStoragePolicySuite bsps = fsd.getBlockStoragePolicySuite();
       srcChild = this.srcIIP.getLastINode();
@@ -701,7 +713,7 @@ class FSDirRenameOp {
         throw new IOException(error);
       } else {
         // update the quota count if necessary
-        fsd.updateCountForDelete(srcChild, srcIIP);
+        fsd.updateCountForDelete(srcChild, srcIIP, srcChildQuotaCounts);
         srcIIP = INodesInPath.replace(srcIIP, srcIIP.length() - 1, null);
         return removedNum;
       }
@@ -716,7 +728,7 @@ class FSDirRenameOp {
         return false;
       } else {
         // update the quota count if necessary
-        fsd.updateCountForDelete(srcChild, srcIIP);
+        fsd.updateCountForDelete(srcChild, srcIIP, srcChildQuotaCounts);
         srcIIP = INodesInPath.replace(srcIIP, srcIIP.length() - 1, null);
         return true;
       }
@@ -727,7 +739,7 @@ class FSDirRenameOp {
       if (removedNum != -1) {
         oldDstChild = dstIIP.getLastINode();
         // update the quota count if necessary
-        fsd.updateCountForDelete(oldDstChild, dstIIP);
+        fsd.updateCountForDelete(oldDstChild, dstIIP, dstChildQuotaCounts);
         dstIIP = INodesInPath.replace(dstIIP, dstIIP.length() - 1, null);
       }
       return removedNum;
@@ -737,15 +749,18 @@ class FSDirRenameOp {
       final INode dstParent = dstParentIIP.getLastINode();
       final byte[] dstChildName = dstIIP.getLastLocalName();
       final INode toDst;
+      final QuotaCounts toDstQuotaCount;
       if (withCount == null) {
         srcChild.setLocalName(dstChildName);
         toDst = srcChild;
+        toDstQuotaCount = srcChildQuotaCounts;
       } else {
         withCount.getReferredINode().setLocalName(dstChildName);
         toDst = new INodeReference.DstReference(dstParent.asDirectory(),
             withCount, dstIIP.getLatestSnapshotId());
+        toDstQuotaCount = null ;
       }
-      return fsd.addLastINodeNoQuotaCheck(dstParentIIP, toDst);
+      return fsd.addLastINodeNoQuotaCheck(dstParentIIP, toDst, toDstQuotaCount);
     }
 
     void updateMtimeAndLease(long timestamp) {
@@ -757,9 +772,11 @@ class FSDirRenameOp {
     void restoreSource() {
       // Rename failed - restore src
       final INode oldSrcChild = srcChild;
+      QuotaCounts quotaCounts = null;
       // put it back
       if (withCount == null) {
         srcChild.setLocalName(srcChildName);
+        quotaCounts = srcChildQuotaCounts;
       } else if (!srcChildIsReference) { // src must be in snapshot
         // the withCount node will no longer be used thus no need to update
         // its reference number here
@@ -777,7 +794,7 @@ class FSDirRenameOp {
       } else {
         // srcParent is not an INodeDirectoryWithSnapshot, we only need to add
         // the srcChild back
-        fsd.addLastINodeNoQuotaCheck(srcParentIIP, srcChild);
+        fsd.addLastINodeNoQuotaCheck(srcParentIIP, srcChild, quotaCounts);
       }
     }
 
@@ -787,7 +804,7 @@ class FSDirRenameOp {
       if (dstParent.isWithSnapshot()) {
         dstParent.undoRename4DstParent(bsps, oldDstChild, dstIIP.getLatestSnapshotId());
       } else {
-        fsd.addLastINodeNoQuotaCheck(dstParentIIP, oldDstChild);
+        fsd.addLastINodeNoQuotaCheck(dstParentIIP, oldDstChild, dstChildQuotaCounts);
       }
       if (oldDstChild != null && oldDstChild.isReference()) {
         final INodeReference removedDstRef = oldDstChild.asReference();

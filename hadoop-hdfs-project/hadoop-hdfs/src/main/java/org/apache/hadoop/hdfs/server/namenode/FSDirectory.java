@@ -1008,10 +1008,10 @@ public class FSDirectory implements Closeable {
    * when image/edits have been loaded and the file/dir to be deleted is not
    * contained in snapshots.
    */
-  void updateCountForDelete(final INode inode, final INodesInPath iip) {
+  void updateCountForDelete(final INode inode, final INodesInPath iip, QuotaCounts srcCounts) {
     if (getFSNamesystem().isImageLoaded() &&
         !inode.isInLatestSnapshot(iip.getLatestSnapshotId())) {
-      QuotaCounts counts = inode.computeQuotaUsage(getBlockStoragePolicySuite());
+      QuotaCounts counts = srcCounts == null ? inode.computeQuotaUsage(getBlockStoragePolicySuite()) : srcCounts;
       unprotectedUpdateCount(iip, iip.length() - 1, counts.negation());
     }
   }
@@ -1198,7 +1198,7 @@ public class FSDirectory implements Closeable {
     cacheName(child);
     writeLock();
     try {
-      return addLastINode(existing, child, modes, true);
+      return addLastINode(existing, child, modes, true, null);
     } finally {
       writeUnlock();
     }
@@ -1349,7 +1349,7 @@ public class FSDirectory implements Closeable {
    */
   @VisibleForTesting
   public INodesInPath addLastINode(INodesInPath existing, INode inode,
-      FsPermission modes, boolean checkQuota) throws QuotaExceededException {
+      FsPermission modes, boolean checkQuota, QuotaCounts quotaCounts) throws QuotaExceededException {
     assert existing.getLastINode() != null &&
         existing.getLastINode().isDirectory();
 
@@ -1380,13 +1380,7 @@ public class FSDirectory implements Closeable {
     // always verify inode name
     verifyINodeName(inode.getLocalNameBytes());
 
-    final boolean isSrcSetSp = inode.isSetStoragePolicy();
-    final byte storagePolicyID = isSrcSetSp ?
-        inode.getLocalStoragePolicyID() :
-        parent.getStoragePolicyID();
-    final QuotaCounts counts = inode
-        .computeQuotaUsage(getBlockStoragePolicySuite(),
-            storagePolicyID, false, Snapshot.CURRENT_STATE_ID);
+    QuotaCounts counts = getQuotaCounts(inode, parent, quotaCounts);
     updateCount(existing, pos, counts, checkQuota);
 
     boolean isRename = (inode.getParent() != null);
@@ -1404,10 +1398,24 @@ public class FSDirectory implements Closeable {
     return INodesInPath.append(existing, inode, inode.getLocalNameBytes());
   }
 
-  INodesInPath addLastINodeNoQuotaCheck(INodesInPath existing, INode i) {
+  private QuotaCounts getQuotaCounts(INode inode, INodeDirectory parent, QuotaCounts quotaCounts) {
+    if (quotaCounts != null) {
+      return quotaCounts;
+    }
+    final boolean isSrcSetSp = inode.isSetStoragePolicy();
+    final byte storagePolicyID = isSrcSetSp ?
+            inode.getLocalStoragePolicyID() :
+            parent.getStoragePolicyID();
+    final QuotaCounts counts = inode
+            .computeQuotaUsage(getBlockStoragePolicySuite(),
+                    storagePolicyID, false, Snapshot.CURRENT_STATE_ID);
+    return counts;
+  }
+
+  INodesInPath addLastINodeNoQuotaCheck(INodesInPath existing, INode i, QuotaCounts quotaCounts) {
     try {
       // All callers do not have create modes to pass.
-      return addLastINode(existing, i, null, false);
+      return addLastINode(existing, i, null, false, quotaCounts);
     } catch (QuotaExceededException e) {
       NameNode.LOG.warn("FSDirectory.addChildNoQuotaCheck - unexpected", e);
     }
